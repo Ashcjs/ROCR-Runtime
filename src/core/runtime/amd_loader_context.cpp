@@ -65,6 +65,24 @@
 namespace rocr {
 namespace {
 
+bool IsLocalRegion(const core::MemoryRegion *region)
+{
+  const AMD::MemoryRegion *amd_region = (AMD::MemoryRegion*)region;
+  if (nullptr == amd_region || !amd_region->IsLocalMemory()) {
+    return false;
+  }
+  return true;
+}
+
+bool IsDebuggerRegistered()
+{
+  return false;
+  // Leaving code commented as it will be used later on
+  //return ((core::Runtime::runtime_singleton_->flag().emulate_aql()) &&
+  //        (0 !=
+  //         core::Runtime::runtime_singleton_->flag().tools_lib_names().size()));
+}
+
 class SegmentMemory {
 public:
   virtual ~SegmentMemory() {}
@@ -244,21 +262,14 @@ bool MappedMemory::Freeze()
 
 class RegionMemory final: public SegmentMemory {
 public:
- static const core::MemoryRegion* AgentLocal(hsa_agent_t agent, bool is_code);
- static const core::MemoryRegion* System(bool is_code);
+  static hsa_region_t AgentLocal(hsa_agent_t agent);
+  static hsa_region_t System();
 
- RegionMemory(const core::MemoryRegion* region, bool is_code)
-     : SegmentMemory(),
-       region_(region),
-       ptr_(nullptr),
-       host_ptr_(nullptr),
-       size_(0),
-       is_code_(is_code) {}
- ~RegionMemory() {}
+  RegionMemory(hsa_region_t region): SegmentMemory(), region_(region), ptr_(nullptr), host_ptr_(nullptr), size_(0) {}
+  ~RegionMemory() {}
 
- void* Address(size_t offset = 0) const override {
-   assert(this->Allocated());
-   return (char*)ptr_ + offset; }
+  void* Address(size_t offset = 0) const override
+    { assert(this->Allocated()); return (char*)ptr_ + offset; }
   void* HostAddress(size_t offset = 0) const override
     { assert(this->Allocated()); return (char*)host_ptr_ + offset; }
   bool Allocated() const override
@@ -273,47 +284,44 @@ private:
   RegionMemory(const RegionMemory&);
   RegionMemory& operator=(const RegionMemory&);
 
-  const core::MemoryRegion* region_;
+  hsa_region_t region_;
   void *ptr_;
   void *host_ptr_;
   size_t size_;
-  bool is_code_;
 };
 
-const core::MemoryRegion* RegionMemory::AgentLocal(hsa_agent_t agent, bool is_code) {
+hsa_region_t RegionMemory::AgentLocal(hsa_agent_t agent)
+{
+  hsa_region_t invalid_region; invalid_region.handle = 0;
   AMD::GpuAgent *amd_agent = (AMD::GpuAgent*)core::Agent::Convert(agent);
-  assert(amd_agent->device_type() == core::Agent::kAmdGpuDevice && "Invalid agent type.");
-  auto agent_local_region =
-      std::find_if(amd_agent->regions().begin(), amd_agent->regions().end(),
-                   [&](const core::MemoryRegion* region) {
-                     const AMD::MemoryRegion* amd_region = (const AMD::MemoryRegion*)region;
-                     return amd_region->IsLocalMemory() & (!amd_region->fine_grain());
-                   });
-  return agent_local_region == amd_agent->regions().end() ? nullptr : *agent_local_region;
+  if (nullptr == amd_agent) {
+    return invalid_region;
+  }
+  auto agent_local_region = std::find_if(amd_agent->regions().begin(), amd_agent->regions().end(), IsLocalRegion);
+  return agent_local_region == amd_agent->regions().end() ?
+    invalid_region : core::MemoryRegion::Convert(*agent_local_region);
 }
 
-const core::MemoryRegion* RegionMemory::System(bool is_code) {
-  if (is_code)
-    return core::Runtime::runtime_singleton_->system_regions_coarse()[0];
-  else
-    return core::Runtime::runtime_singleton_->system_regions_fine()[0];
+hsa_region_t RegionMemory::System() {
+  const core::MemoryRegion* default_system_region =
+      core::Runtime::runtime_singleton_->system_regions_fine()[0];
+
+  assert(default_system_region != NULL);
+
+  return core::MemoryRegion::Convert(default_system_region);
 }
 
-bool RegionMemory::Allocate(size_t size, size_t align, bool zero) {
+bool RegionMemory::Allocate(size_t size, size_t align, bool zero)
+{
   assert(!this->Allocated());
   assert(0 < size);
   assert(0 < align && 0 == (align & (align - 1)));
-  core::MemoryRegion::AllocateFlags flags = core::MemoryRegion::AllocateNoFlags;
-  if (is_code_) flags = core::MemoryRegion::AllocateExecutable;
-  if (HSA_STATUS_SUCCESS !=
-      core::Runtime::runtime_singleton_->AllocateMemory(region_, size, flags, &ptr_)) {
+  if (HSA_STATUS_SUCCESS != HSA::hsa_memory_allocate(region_, size, &ptr_)) {
     ptr_ = nullptr;
     return false;
   }
   assert(0 == ((uintptr_t)ptr_) % align);
-  if (HSA_STATUS_SUCCESS !=
-      core::Runtime::runtime_singleton_->AllocateMemory(
-          RegionMemory::System(false), size, core::MemoryRegion::AllocateNoFlags, &host_ptr_)) {
+  if (HSA_STATUS_SUCCESS != HSA::hsa_memory_allocate(RegionMemory::System(), size, &host_ptr_)) {
     HSA::hsa_memory_free(ptr_);
     ptr_ = nullptr;
     host_ptr_ = nullptr;
@@ -326,7 +334,8 @@ bool RegionMemory::Allocate(size_t size, size_t align, bool zero) {
   return true;
 }
 
-bool RegionMemory::Copy(size_t offset, const void* src, size_t size) {
+bool RegionMemory::Copy(size_t offset, const void *src, size_t size)
+{
   assert(this->Allocated() && nullptr != host_ptr_);
   assert(nullptr != src);
   assert(0 < size);
@@ -349,7 +358,8 @@ void RegionMemory::Free()
 bool RegionMemory::Freeze() {
   assert(this->Allocated() && nullptr != host_ptr_);
 
-  core::Agent* agent = region_->owner();
+  core::Agent* agent = reinterpret_cast<AMD::MemoryRegion*>(
+                           core::MemoryRegion::Convert(region_))->owner();
   if (agent != NULL && agent->device_type() == core::Agent::kAmdGpuDevice) {
     if (HSA_STATUS_SUCCESS != agent->DmaCopy(ptr_, host_ptr_, size_)) {
       return false;
@@ -358,14 +368,11 @@ bool RegionMemory::Freeze() {
     memcpy(ptr_, host_ptr_, size_);
   }
 
-  // Invalidate agent caches which may hold lines of the new allocation.
-  if (is_code_ && (region_->owner()->device_type() == core::Agent::kAmdGpuDevice))
-    ((AMD::GpuAgent*)region_->owner())->InvalidateCodeCaches();
-
   return true;
 }
 
 }  // namespace anonymous
+
 namespace amd {
 
 hsa_isa_t LoaderContext::IsaFromName(const char *name) {
@@ -420,22 +427,21 @@ void* LoaderContext::SegmentAlloc(amdgpu_hsa_elf_segment_t segment,
   assert(0 < size);
   assert(0 < align && 0 == (align & (align - 1)));
 
-  hsa_profile_t agent_profile;
-  if (HSA_STATUS_SUCCESS !=
-      HSA::hsa_agent_get_info(agent, HSA_AGENT_INFO_PROFILE, &agent_profile)) {
-    return nullptr;
-  }
-
   SegmentMemory *mem = nullptr;
   switch (segment) {
   case AMDGPU_HSA_SEGMENT_GLOBAL_AGENT:
   case AMDGPU_HSA_SEGMENT_READONLY_AGENT: {
+    hsa_profile_t agent_profile;
+    if (HSA_STATUS_SUCCESS != HSA::hsa_agent_get_info(agent, HSA_AGENT_INFO_PROFILE, &agent_profile)) {
+      return nullptr;
+    }
+
     switch (agent_profile) {
     case HSA_PROFILE_BASE:
-      mem = new (std::nothrow) RegionMemory(RegionMemory::AgentLocal(agent, false), false);
+      mem = new (std::nothrow) RegionMemory(RegionMemory::AgentLocal(agent));
       break;
     case HSA_PROFILE_FULL:
-      mem = new (std::nothrow) RegionMemory(RegionMemory::System(false), false);
+      mem = new (std::nothrow) RegionMemory(RegionMemory::System());
       break;
     default:
       assert(false);
@@ -443,13 +449,20 @@ void* LoaderContext::SegmentAlloc(amdgpu_hsa_elf_segment_t segment,
     break;
   }
   case AMDGPU_HSA_SEGMENT_GLOBAL_PROGRAM: {
-    mem = new (std::nothrow) RegionMemory(RegionMemory::System(false), false);
+    mem = new (std::nothrow) RegionMemory(RegionMemory::System());
     break;
   }
   case AMDGPU_HSA_SEGMENT_CODE_AGENT: {
+    hsa_profile_t agent_profile;
+    if (HSA_STATUS_SUCCESS != HSA::hsa_agent_get_info(agent, HSA_AGENT_INFO_PROFILE, &agent_profile)) {
+      return nullptr;
+    }
+
     switch (agent_profile) {
     case HSA_PROFILE_BASE:
-      mem = new (std::nothrow) RegionMemory(RegionMemory::AgentLocal(agent, true), true);
+      mem = new (std::nothrow) RegionMemory(IsDebuggerRegistered() ?
+                                            RegionMemory::System() :
+                                            RegionMemory::AgentLocal(agent));
       break;
     case HSA_PROFILE_FULL:
       mem = new (std::nothrow) MappedMemory(((AMD::GpuAgentInt*)core::Agent::Convert(agent))->is_kv_device());
@@ -457,6 +470,10 @@ void* LoaderContext::SegmentAlloc(amdgpu_hsa_elf_segment_t segment,
     default:
       assert(false);
     }
+
+    // Invalidate agent caches which may hold lines of the new allocation.
+    ((AMD::GpuAgentInt*)core::Agent::Convert(agent))->InvalidateCodeCaches();
+
     break;
   }
   default:
